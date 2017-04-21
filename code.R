@@ -1,6 +1,34 @@
+suppressMessages(library("jsonlite"))
+suppressMessages(library("plotly"))
+suppressMessages(library("purrr"))
+suppressMessages(library("RecordLinkage"))
 setwd('/home/yasar/kaggle/two_sigma_renthop/')
+
+#trainData <- fromJSON("train.json")
+#variables <- setdiff(names(trainData), c("photos"))
+#train <-map_at(trainData, variables, unlist) %>% tibble::as_tibble(.)
+#testData <- fromJSON("test.json")
+#variables <- setdiff(names(testData), c("photos"))
+#test <-map_at(testData, variables, unlist) %>% tibble::as_tibble(.)
+
+#READING INPUT
 train <- read.csv('train.csv')
+test <- read.csv('test.csv')
+
+#ADDING ADDRESS SIMILARITY USING LENENSHTEIN DISTANCE
+train$addressSimilarity <- levenshteinSim(tolower(train$street_address),tolower(train$display_address))
+test$addressSimilarity <- levenshteinSim(tolower(test$street_address),tolower(test$display_address))
+
+#PRE_PROCESSING TRAIN DATA
+#REMOVING NAS
 train <- train[complete.cases(train[, 'price']),]
+
+
+#GETTING PROBABILITIES OF TARGET LEVELS
+train$interest_level <- as.factor(as.character(train$interest_level))
+table(train$interest_level)/nrow(table)
+
+#CLEANING THE STREET ADDRESS TO STANDARDISE ADDRESS
 train$street_address <- as.character(train$street_address)
 train$street_address <- tolower(train$street_address)
 train$street_address <- gsub('[^a-z0-9 ]','',train$street_address)
@@ -17,22 +45,27 @@ train$street_address <- gsub(' n ',' north ',train$street_address)
 train$street_address <- gsub(' s ',' south ',train$street_address)
 train$street_address <- gsub('^[0-9]* ','',train$street_address)
 train$street_address <- gsub('^[ ]*','',train$street_address)
+
+#CREATING NEW VARIABLE - DIRECTION
 train$direction <- 'unknown'
 train$direction[grep('east ',train$street_address)]='east'
 train$direction[grep('west ',train$street_address)]='west'
 train$direction[grep('north ',train$street_address)]='north'
 train$direction[grep('south ',train$street_address)]='south'
+
+
 train$street_address <- gsub('east ','',train$street_address)
 train$street_address <- gsub('west ','',train$street_address)
 train$street_address <- gsub('north ','',train$street_address)
 train$street_address <- gsub('south ','',train$street_address)
 
+#REMOVING UNWANTED FEATURES
 train$X <- NULL
 train$created <- NULL
 train$display_address <- NULL
-train$photos <- NULL
 train$description <- NULL
 
+#CLEANING FEATURES
 train$bathrooms <- as.character(train$bathrooms)
 train$bedrooms <- as.character(train$bedrooms)
 train$bathrooms <- as.numeric(train$bathrooms)
@@ -42,11 +75,13 @@ train$interest_level <- as.factor(as.character(train$interest_level))
 
 train$latitude <- as.numeric(as.character(train$latitude))
 train$listing_id <- NULL
-train$manager_id <- NULL
 train$street_address <- as.factor(train$street_address)
 
+#CREATING LATITUDE AND LONGITUDE GROUP FACTORS
 train$latitude_group <- as.factor(as.integer(train$latitude*10))
 train$longitude_group <- as.factor(as.integer(train$longitude*10))
+
+#EXTRACTING LIST OF ALL TRAIN$FEATURES - THE VALUES IN TRAIN$FEATURES ARE PYTHONLISTS
 train$features <- as.character(train$features)
 train$features<- gsub('[^a-zA-Z,]','',train$features)
 train$features<- gsub('^u','',train$features)
@@ -54,6 +89,8 @@ train$features<- gsub(',u',',',train$features)
 train$features <- tolower(train$features)
 train$features1 <- sapply(train$features,FUN = function(x) as.character(unlist(strsplit(x,','))))
 
+
+#COMBINING ALL FEATURES
 all_features <- unique(unlist(train$features1))
 
 t <- table(all_features)
@@ -61,8 +98,10 @@ for (feature in all_features){
   t[feature] <- length(grep(feature,train$features))
 }
 
-feature_counts <- as.data.frame(t)
+#GETTING FEATURES THAT ARE AVAILABLE IN ATLEAST 200 DATA POINTS IN ORDER TO RETAIN THEM
 print (t[t>200])
+
+#CREATING NEW VARIABLES BASED ON TOP FEATURES IN TRAIN$FEATURES
 train$ac <- 0
 train$ac[grep('ac', train$features)] <- 1
 
@@ -149,23 +188,63 @@ train$deck <- 0
 train$deck[grep('deck', train$features)] <- 1
 train$deck[grep('loft', train$features)] <- 1
 
-train_final <- train
 train$features <- NULL
 train$features1 <- NULL
 
+#RETAINING STREET ADDRESS WITH ATLEAST OBSERVATIONS SO THAT THERE IS ENOUGH EVIDENCE TO FIGURE OUT THE INTEREST LEVEL
 train$street_address <- gsub(' ','',train$street_address)
-
 strt<-table(train$street_address)
 strt <- as.data.frame(strt)
-strt <- strt[strt$Freq>100,]
+strt <- strt[strt$Freq>5,]
 train$street_address <- sapply(train$street_address,FUN = function(x) ifelse(x %in% strt$Var1,x,''))
 train$street_address <- as.factor(train$street_address)
 train$direction <- as.factor(train$direction)
 
+#GETTING THE NUMBER OF PICTURES POSTED
+library(stringr)
+train$photos <- as.character(train$photos)
+train$photos <- str_count(train$photos,"u'")
+train$photos <- as.numeric(train$photos)
+
+#GETTING INTEREST LEVEL PROBABILITIES OF MANAGERS
+library(dplyr)
+train$manager_id <- as.character(train$manager_id)
+manager_table <- table(train$manager_id)
+manager_table <- as.data.frame(manager_table)
+manager_probs <- train %>% group_by(manager_id,interest_level) %>% summarise('manager_interest_count' = length(interest_level)) 
+manager_probs <- merge(manager_probs,manager_table,by.x='manager_id',by.y='Var1')
+manager_probs$manager_probability <- manager_probs$manager_interest_count/manager_probs$Freq
+library(reshape2)
+manager_probs$manager_interest_count <- NULL
+manager_probs$Freq<-NULL
+manager_probs <- dcast(manager_probs,manager_id~interest_level)
+#FIXING NAS TO FIXED PROBABILITY VALUES
+manager_probs$low[is.na(manager_probs$low)] = 0.69
+manager_probs$medium[is.na(manager_probs$medium)] = 0.225
+manager_probs$high[is.na(manager_probs$high)] = 0.085
+train <- merge(train,manager_probs,by = c('manager_id'))
+train$manager_id <- NULL
+
+#GETTING INTEREST LEVEL PROBABILITIES FOR DIFFERENT LATITUDE LONGITUDE GROUPS
+train_latitude_groups <- as.character(train$latitude_group)
+train_longitude_groups <- as.character(train$longitude_group)
+lat_long_counts <- train %>% group_by(latitude_group,longitude_group) %>% count()
+lat_long_probs <- train %>% group_by(latitude_group,longitude_group,interest_level) %>% summarise('lat_long_interest_count'=length(interest_level))
+lat_long_probs <- merge(lat_long_probs,lat_long_counts,by=c('latitude_group','longitude_group'))
+lat_long_probs$lat_long_prob <- lat_long_probs$lat_long_interest_count/lat_long_probs$n
+lat_long_probs$lat_long_interest_count <- NULL
+lat_long_probs$n <- NULL
+library(reshape2)
+lat_long_probs = dcast(lat_long_probs,latitude_group+longitude_group~interest_level)
+#FIXING NAS TO FIXED PROBABILITY VALUES
+lat_long_probs$high[is.na(lat_long_probs$high)] <- 0.085
+lat_long_probs$medium[is.na(lat_long_probs$medium)] <- 0.225
+lat_long_probs$low[is.na(lat_long_probs$low)] <- 0.69
+train <- merge(train,lat_long_probs,by = c('latitude_group','longitude_group'))
+
+#CREATING DUMMIES
 library(dummies)
-
 train_d <- dummy.data.frame(train)
-
 target <- train$interest_level
 train_d$interest_levelhigh <- NULL
 train_d$interest_levellow <- NULL
@@ -177,16 +256,10 @@ target[target=='medium']=1
 target[target=='high']=2
 target<-as.numeric(target)
 
-xgb_model1 <- xgb.cv(data = as.matrix(train_d), label = target, nrounds = 100, max_depth=10,objective = 'multi:softprob',num_class = 3, nfold = 5)
-
-#xgb_model <- xgboost(data = as.matrix(train_d), label = target, nrounds = 100, max_depth=10,objective = 'multi:softprob',num_class = 3)
-
 #############################################################################################
-####################################### TO RUN ############################################
+####################################### SAME DATA CLEANING ON TEST ############################################
 
-test <- read.csv('test.csv')
 test <- test[complete.cases(test[, 'price']),]
-identifier <- test$listing_id
 test$street_address <- as.character(test$street_address)
 test$street_address <- tolower(test$street_address)
 test$street_address <- gsub('[^a-z0-9 ]','',test$street_address)
@@ -212,25 +285,18 @@ test$street_address <- gsub('east ','',test$street_address)
 test$street_address <- gsub('west ','',test$street_address)
 test$street_address <- gsub('north ','',test$street_address)
 test$street_address <- gsub('south ','',test$street_address)
-
 test$X <- NULL
 test$created <- NULL
 test$display_address <- NULL
-test$photos <- NULL
 test$description <- NULL
-
 test$bathrooms <- as.character(test$bathrooms)
 test$bedrooms <- as.character(test$bedrooms)
 test$bathrooms <- as.numeric(test$bathrooms)
 test$bedrooms <- as.numeric(test$bedrooms)
 test$building_id <- NULL
 test$interest_level <- ''
-
 test$latitude <- as.numeric(as.character(test$latitude))
-test$listing_id <- NULL
-test$manager_id <- NULL
 test$street_address <- as.factor(test$street_address)
-
 test$latitude_group <- as.factor(as.integer(test$latitude*10))
 test$longitude_group <- as.factor(as.integer(test$longitude*10))
 test$features <- as.character(test$features)
@@ -239,16 +305,7 @@ test$features<- gsub('^u','',test$features)
 test$features<- gsub(',u',',',test$features)
 test$features <- tolower(test$features)
 test$features1 <- sapply(test$features,FUN = function(x) as.character(unlist(strsplit(x,','))))
-
-#all_features <- unique(unlist(test$features1))
-
-#t <- table(all_features)
-#for (feature in all_features){
-#  t[feature] <- length(grep(feature,test$features))
-#}
-
-#feature_counts <- as.data.frame(t)
-#print (t[t>200])
+#CREATING VARIABLES BASED ON FEATURES
 test$ac <- 0
 test$ac[grep('ac', test$features)] <- 1
 
@@ -269,7 +326,7 @@ test$deck[grep('deck', test$features)] <- 1
 
 test$dining <- 0
 test$dining[grep('dining', test$features)] <- 1
-#################################
+
 test$laundry <- 0
 test$laundry[grep('laundry', test$features)] <- 1
 
@@ -335,31 +392,53 @@ test$deck <- 0
 test$deck[grep('deck', test$features)] <- 1
 test$deck[grep('loft', test$features)] <- 1
 
-test_final <- test
 test$features <- NULL
 test$features1 <- NULL
 
 test$street_address <- gsub(' ','',test$street_address)
-
 test$street_address <- sapply(test$street_address,FUN = function(x) ifelse(x %in% strt$Var1,x,''))
-test$street_address <- as.factor(test$street_address)
 test$direction <- as.factor(test$direction)
-
+test$photos <- as.character(test$photos)
+test$photos <- str_count(test$photos,"u'")
+test$photos <- as.numeric(test$photos)
+test$manager_id <- as.character(test$manager_id)
+manager_probs$manager_id <- as.character(manager_probs$manager_id)
+lat_long_probs$latitude_group <- as.character(lat_long_probs$latitude_group)
+lat_long_probs$longitude_group <- as.character(lat_long_probs$longitude_group)
+test$latitude_group <- as.character(test$latitude_group)
+test$longitude_group <- as.character(test$longitude_group)
+test <- merge(test,manager_probs,by='manager_id')
+test$manager_id <- NULL
+test <- merge(test,lat_long_probs,by=c('latitude_group','longitude_group'))
+test$latitude_group <- as.factor(test$latitude_group)
+test$longitude_group <- as.factor(test$longitude_group)
+identifier <- test$listing_id
+test$listing_id <- NULL
+#CREATING DUMMIES
 library(dummies)
 test <- test[colnames(train)]
 test_d <- dummy.data.frame(test)
+#RETAINING TRAIN FEATURES ONLY IF IT IS PRESENT IN TEST SET
+colnames(train_d)%in%colnames(test_d)
+train_d <- train_d[colnames(test_d)]
+
+xgb_model <- xgboost(data = as.matrix(train_d), label = target, nrounds = 150, max_depth=30,objective = 'multi:softprob',num_class = 3)
 
 predicted <- predict(xgb_model,as.matrix(test_d))
-
-output <- data.frame('listing_id'=identifier,'high'=0.3,'medium'=0.3,'low'=0.4)
-output$low <- predicted[seq(1,221307,3)]
-output$medium <- predicted[seq(2,221307,3)]
-output$high <- predicted[seq(3,221307,3)]
-
+output <- data.frame('listing_id'=identifier,'high'=0.085,'medium'=0.225,'low'=0.69)
+output$low <- predicted[seq(1,216921,3)]
+output$medium <- predicted[seq(2,216921,3)]
+output$high <- predicted[seq(3,216921,3)]
+sample <- read.csv('sample_submission.csv')
+sample$low <- NULL
+sample$medium <- NULL
+sample$high <- NULL
 sample$listing_id <- as.character(sample$listing_id)
 output$listing_id <- as.character(output$listing_id)
-
 result <- merge(sample['listing_id'],output,by='listing_id',all.x=TRUE)
-write.csv(result,'solution.csv',row.names = F)
 summary(result)
-result[is.na(result)] = 0.3333
+result$low[is.na(result$low)]= 0.69
+result$medium[is.na(result$medium)]= 0.225
+result$high[is.na(result$high)]= 0.085
+write.csv(result,'solution1.csv',row.names = F)
+
